@@ -35,7 +35,6 @@
 //! }
 //!
 //! # async fn run() -> Result<()> {
-//! // Pass an Arc<T> directly — no wrapper type needed.
 //! let tracker = Arc::new(InMemoryTracker::default());
 //!
 //! let op = Operator::new(services::Memory::default())?
@@ -63,10 +62,6 @@ use opendal::{Buffer, Error, ErrorKind, Metadata, Result};
 /// once per process per id (to warm an in-memory cache) and calls
 /// `set_bytes_written` every time that cached total changes.
 ///
-/// A blanket impl is provided for `Arc<T>` where `T: QuotaTracker`, so you
-/// can pass an `Arc<YourTracker>` directly to [`QuotaLayer::new`] and share
-/// it across multiple operators or threads without any wrapper type.
-///
 /// # Concurrency note
 ///
 /// `QuotaLayer` serializes its own check-then-update sequence with an
@@ -89,30 +84,11 @@ pub trait QuotaTracker: Send + Sync + 'static {
     async fn set_bytes_written(&self, id: &str, bytes: u64) -> Result<()>;
 }
 
-/// Blanket impl so that `Arc<T>` satisfies `QuotaTracker` whenever `T` does.
-///
-/// This means you can pass `Arc<YourTracker>` straight to [`QuotaLayer::new`]
-/// and share one backing tracker across multiple operators (or between the
-/// layer and your own accounting code) without any wrapper type.
-#[async_trait]
-impl<T: QuotaTracker> QuotaTracker for Arc<T> {
-    async fn get_bytes_written(&self, id: &str) -> Result<u64> {
-        (**self).get_bytes_written(id).await
-    }
-
-    async fn set_bytes_written(&self, id: &str, bytes: u64) -> Result<()> {
-        (**self).set_bytes_written(id, bytes).await
-    }
-}
-
 /// Shared state behind one `QuotaLayer`, cloned (via `Arc`) into every
 /// accessor and writer it produces.
 struct QuotaState<T: QuotaTracker> {
     id: String,
-    /// The tracker is stored as `T` (not `Arc<T>`) so that `T` itself can be
-    /// `Arc<SomeConcreteTracker>`, letting callers share a single backing
-    /// tracker across multiple operators without a wrapper type.
-    tracker: T,
+    tracker: Arc<T>,
     limit: u64,
     /// In-process cache of the last known total. `None` until the first
     /// write touches it, at which point it's warmed from the tracker.
@@ -182,10 +158,6 @@ impl<T: QuotaTracker> QuotaState<T> {
 /// persisting usage via a [`QuotaTracker`] so it survives restarts. Reads
 /// are never affected.
 ///
-/// The `tracker` parameter accepts any `T: QuotaTracker`, including
-/// `Arc<YourTracker>` (via the blanket impl), so a single tracker can be
-/// shared across multiple operators without a wrapper type.
-///
 /// # Example
 ///
 /// ```ignore
@@ -218,13 +190,11 @@ impl<T: QuotaTracker> QuotaLayer<T> {
     ///   against. Passed through to every call to `tracker`'s get/set
     ///   methods, so one `QuotaTracker` implementation can back many
     ///   independently-tracked operators (e.g. one per tenant).
-    /// - `tracker`: the get/set persistence backing this quota's usage.
-    ///   Pass an `Arc<YourTracker>` to share the same backing tracker
-    ///   across multiple operators (the blanket `impl QuotaTracker for Arc<T>`
-    ///   makes this work without any wrapper).
+    /// - `tracker`: an `Arc`-wrapped tracker so it can be shared across
+    ///   multiple operators or retained by the caller for introspection.
     /// - `limit_bytes`: the total number of bytes this id is allowed to
     ///   have written, ever (cumulative, like free space on a disk).
-    pub fn new(id: impl Into<String>, tracker: T, limit_bytes: u64) -> Self {
+    pub fn new(id: impl Into<String>, tracker: Arc<T>, limit_bytes: u64) -> Self {
         Self {
             state: Arc::new(QuotaState {
                 id: id.into(),
@@ -374,19 +344,17 @@ mod tests {
         }
     }
 
-    /// Pass `Arc<MemoryTracker>` directly — no `SharedTracker` wrapper needed
-    /// thanks to the blanket `impl QuotaTracker for Arc<T>`.
     fn build_op(id: &str, tracker: Arc<MemoryTracker>, limit: u64) -> Operator {
         Operator::new(services::Memory::default())
             .unwrap()
-            .layer(QuotaLayer::new(id, Arc::clone(&tracker), limit))
+            .layer(QuotaLayer::new(id, tracker, limit))
             .finish()
     }
 
     #[tokio::test]
     async fn writes_within_quota_succeed_and_are_tracked() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op("tenant-a", tracker.clone(), 1024);
+        let op = build_op("tenant-a", Arc::clone(&tracker), 1024);
 
         op.write("a.txt", "hello world").await.unwrap();
         assert_eq!(
@@ -404,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn write_exceeding_quota_is_rejected() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op("tenant-b", tracker.clone(), 10);
+        let op = build_op("tenant-b", Arc::clone(&tracker), 10);
 
         let err = op
             .write("too-big.txt", "this is way more than 10 bytes")
@@ -420,12 +388,12 @@ mod tests {
     async fn quota_persists_across_separate_operators_with_same_id() {
         let tracker = Arc::new(MemoryTracker::default());
 
-        let op1 = build_op("tenant-c", tracker.clone(), 20);
+        let op1 = build_op("tenant-c", Arc::clone(&tracker), 20);
         op1.write("a.txt", "0123456789").await.unwrap(); // 10 bytes
 
         // A brand new operator instance, same id, same backing tracker -
         // simulates a process restart that re-warms from the DB.
-        let op2 = build_op("tenant-c", tracker.clone(), 20);
+        let op2 = build_op("tenant-c", Arc::clone(&tracker), 20);
         op2.write("b.txt", "0123456789").await.unwrap(); // another 10 bytes, at the limit
 
         let err = op2.write("c.txt", "x").await.unwrap_err();
@@ -437,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn aborted_write_releases_its_reservation() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op("tenant-f", tracker.clone(), 10);
+        let op = build_op("tenant-f", Arc::clone(&tracker), 10);
 
         // Stream a writer manually so we can abort it ourselves instead of
         // closing it.
@@ -458,8 +426,8 @@ mod tests {
     #[tokio::test]
     async fn different_ids_have_independent_quotas() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op_a = build_op("tenant-d", tracker.clone(), 5);
-        let op_e = build_op("tenant-e", tracker.clone(), 5);
+        let op_a = build_op("tenant-d", Arc::clone(&tracker), 5);
+        let op_e = build_op("tenant-e", Arc::clone(&tracker), 5);
 
         op_a.write("a.txt", "12345").await.unwrap();
         assert!(op_a.write("a2.txt", "x").await.is_err());
