@@ -9,10 +9,8 @@
 //! `RouteLayer`: construct it and hand it to `Operator::layer`.
 //!
 //! ```ignore
-//! // Adjust the `crate::quota_layer` path below to wherever you place this
-//! // module in your own crate (e.g. `use my_crate::quota_layer::...`).
 //! use std::collections::HashMap;
-//! use std::sync::Mutex;
+//! use std::sync::Arc;
 //!
 //! use async_trait::async_trait;
 //! use opendal::{Operator, Result, services};
@@ -22,23 +20,26 @@
 //! /// Toy in-memory tracker. In real usage this would read/write a row in
 //! /// whatever database backs your quota accounting.
 //! #[derive(Default)]
-//! struct InMemoryTracker(Mutex<HashMap<String, u64>>);
+//! struct InMemoryTracker(tokio::sync::Mutex<HashMap<String, u64>>);
 //!
 //! #[async_trait]
 //! impl QuotaTracker for InMemoryTracker {
 //!     async fn get_bytes_written(&self, id: &str) -> Result<u64> {
-//!         Ok(*self.0.lock().unwrap().get(id).unwrap_or(&0))
+//!         Ok(*self.0.lock().await.get(id).unwrap_or(&0))
 //!     }
 //!
 //!     async fn set_bytes_written(&self, id: &str, bytes: u64) -> Result<()> {
-//!         self.0.lock().unwrap().insert(id.to_string(), bytes);
+//!         self.0.lock().await.insert(id.to_string(), bytes);
 //!         Ok(())
 //!     }
 //! }
 //!
 //! # async fn run() -> Result<()> {
+//! // Pass an Arc<T> directly — no wrapper type needed.
+//! let tracker = Arc::new(InMemoryTracker::default());
+//!
 //! let op = Operator::new(services::Memory::default())?
-//!     .layer(QuotaLayer::new("tenant-a", InMemoryTracker::default(), 1024))
+//!     .layer(QuotaLayer::new("tenant-a", Arc::clone(&tracker), 1024))
 //!     .finish();
 //!
 //! op.write("foo.txt", "hello world").await?;
@@ -62,6 +63,10 @@ use opendal::{Buffer, Error, ErrorKind, Metadata, Result};
 /// once per process per id (to warm an in-memory cache) and calls
 /// `set_bytes_written` every time that cached total changes.
 ///
+/// A blanket impl is provided for `Arc<T>` where `T: QuotaTracker`, so you
+/// can pass an `Arc<YourTracker>` directly to [`QuotaLayer::new`] and share
+/// it across multiple operators or threads without any wrapper type.
+///
 /// # Concurrency note
 ///
 /// `QuotaLayer` serializes its own check-then-update sequence with an
@@ -84,10 +89,29 @@ pub trait QuotaTracker: Send + Sync + 'static {
     async fn set_bytes_written(&self, id: &str, bytes: u64) -> Result<()>;
 }
 
+/// Blanket impl so that `Arc<T>` satisfies `QuotaTracker` whenever `T` does.
+///
+/// This means you can pass `Arc<YourTracker>` straight to [`QuotaLayer::new`]
+/// and share one backing tracker across multiple operators (or between the
+/// layer and your own accounting code) without any wrapper type.
+#[async_trait]
+impl<T: QuotaTracker> QuotaTracker for Arc<T> {
+    async fn get_bytes_written(&self, id: &str) -> Result<u64> {
+        (**self).get_bytes_written(id).await
+    }
+
+    async fn set_bytes_written(&self, id: &str, bytes: u64) -> Result<()> {
+        (**self).set_bytes_written(id, bytes).await
+    }
+}
+
 /// Shared state behind one `QuotaLayer`, cloned (via `Arc`) into every
 /// accessor and writer it produces.
 struct QuotaState<T: QuotaTracker> {
     id: String,
+    /// The tracker is stored as `T` (not `Arc<T>`) so that `T` itself can be
+    /// `Arc<SomeConcreteTracker>`, letting callers share a single backing
+    /// tracker across multiple operators without a wrapper type.
     tracker: T,
     limit: u64,
     /// In-process cache of the last known total. `None` until the first
@@ -158,14 +182,19 @@ impl<T: QuotaTracker> QuotaState<T> {
 /// persisting usage via a [`QuotaTracker`] so it survives restarts. Reads
 /// are never affected.
 ///
+/// The `tracker` parameter accepts any `T: QuotaTracker`, including
+/// `Arc<YourTracker>` (via the blanket impl), so a single tracker can be
+/// shared across multiple operators without a wrapper type.
+///
 /// # Example
 ///
 /// ```ignore
+/// # use std::sync::Arc;
 /// # use opendal::{Operator, Result, services};
 /// # use crate::quota_layer::QuotaLayer;
-/// # async fn run(tracker: impl crate::quota_layer::QuotaTracker) -> Result<()> {
+/// # async fn run(tracker: Arc<impl crate::quota_layer::QuotaTracker>) -> Result<()> {
 /// let op = Operator::new(services::Memory::default())?
-///     .layer(QuotaLayer::new("tenant-a", tracker, 10 * 1024 * 1024))
+///     .layer(QuotaLayer::new("tenant-a", Arc::clone(&tracker), 10 * 1024 * 1024))
 ///     .finish();
 /// # Ok(())
 /// # }
@@ -190,6 +219,9 @@ impl<T: QuotaTracker> QuotaLayer<T> {
     ///   methods, so one `QuotaTracker` implementation can back many
     ///   independently-tracked operators (e.g. one per tenant).
     /// - `tracker`: the get/set persistence backing this quota's usage.
+    ///   Pass an `Arc<YourTracker>` to share the same backing tracker
+    ///   across multiple operators (the blanket `impl QuotaTracker for Arc<T>`
+    ///   makes this work without any wrapper).
     /// - `limit_bytes`: the total number of bytes this id is allowed to
     ///   have written, ever (cumulative, like free space on a disk).
     pub fn new(id: impl Into<String>, tracker: T, limit_bytes: u64) -> Self {
@@ -319,6 +351,7 @@ impl<W: oio::Write, T: QuotaTracker> oio::Write for QuotaWriter<W, T> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use opendal::{Operator, services};
     use tokio::sync::Mutex;
@@ -341,27 +374,13 @@ mod tests {
         }
     }
 
+    /// Pass `Arc<MemoryTracker>` directly — no `SharedTracker` wrapper needed
+    /// thanks to the blanket `impl QuotaTracker for Arc<T>`.
     fn build_op(id: &str, tracker: Arc<MemoryTracker>, limit: u64) -> Operator {
         Operator::new(services::Memory::default())
             .unwrap()
-            .layer(QuotaLayer::new(id, SharedTracker(tracker), limit))
+            .layer(QuotaLayer::new(id, Arc::clone(&tracker), limit))
             .finish()
-    }
-
-    /// `QuotaTracker` needs an owned type per layer; this thin wrapper lets
-    /// tests share one `MemoryTracker` across multiple operators/layers so
-    /// they can assert on persisted totals afterward.
-    struct SharedTracker(Arc<MemoryTracker>);
-
-    #[async_trait]
-    impl QuotaTracker for SharedTracker {
-        async fn get_bytes_written(&self, id: &str) -> Result<u64> {
-            self.0.get_bytes_written(id).await
-        }
-
-        async fn set_bytes_written(&self, id: &str, bytes: u64) -> Result<()> {
-            self.0.set_bytes_written(id, bytes).await
-        }
     }
 
     #[tokio::test]
